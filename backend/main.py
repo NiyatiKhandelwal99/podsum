@@ -4,7 +4,7 @@ import logging
 from fastapi import FastAPI
 
 from config import settings
-from routers import health, generate
+from routers import health, generate, youtube
 
 # Configure logging
 logging.basicConfig(
@@ -23,6 +23,7 @@ app = FastAPI(
 # Include routers
 app.include_router(health.router)
 app.include_router(generate.router)
+app.include_router(youtube.router)
 
 
 @app.on_event("startup")
