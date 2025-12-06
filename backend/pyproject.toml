@@ -2,11 +2,15 @@
 name = "podcast-summarizer-backend"
 version = "0.1.0"
 description = "Backend API for podcast summarization"
-requires-python = ">=3.10"
+requires-python = "==3.12.*"
 dependencies = [
     "fastapi>=0.104.1",
     "uvicorn[standard]>=0.24.0",
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
+    "gradientai>=1.0.0",
+    "yt-dlp>=2024.0.0",
+    "youtube-transcript-api>=0.6.0",
+    "langchain-mcp-adapters>=0.1.0",
 ]
 
