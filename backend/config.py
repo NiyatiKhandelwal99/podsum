@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     # Set GRADIENT_MODEL in .env to override (e.g., GRADIENT_MODEL=gpt-oss-20b)
     gradient_model: str = "openai-gpt-oss-120b"
     
+    # YouTube Transcript Proxy (optional - for IP ban workaround)
+    # Format: "http://user:pass@host:port" or "http://host:port"
+    youtube_proxy: str = ""
+    
+    # YouTube Browser Cookies (for bot verification bypass)
+    # Options: "chrome", "firefox", "safari", "edge", "brave", "opera", "vivaldi"
+    # Or path to a cookies.txt file
+    youtube_cookies_from_browser: str = ""
+    
     model_config = SettingsConfigDict(
         env_file=str(env_file_path),
         case_sensitive=False,

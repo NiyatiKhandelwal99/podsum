@@ -35,7 +35,9 @@ async def summarize_youtube_video(request: YouTubeSummarizeRequest):
     try:
         summarizer = YouTubeSummarizer(
             model_access_key=settings.model_access_key,
-            model=settings.gradient_model
+            model=settings.gradient_model,
+            proxy=settings.youtube_proxy,
+            cookies_from_browser=settings.youtube_cookies_from_browser
         )
         
         result = await summarizer.summarize_video(request.url)

@@ -1,18 +1,16 @@
 """YouTube video transcript extraction and summarization service."""
 
 import re
+import json
 import asyncio
 import logging
+import tempfile
 from typing import Optional
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-)
+import yt_dlp
 from gradient import Gradient
 
 logger = logging.getLogger(__name__)
@@ -41,16 +39,20 @@ class YouTubeSummarizer:
     CHUNK_SIZE = 8000  # ~2000 tokens per chunk - smaller for better summaries
     MAX_CHUNKS_FOR_SUMMARY = 30  # Increased limit for longer videos
 
-    def __init__(self, model_access_key: str, model: str = "openai-gpt-oss-120b"):
+    def __init__(self, model_access_key: str, model: str = "openai-gpt-oss-120b", proxy: str = "", cookies_from_browser: str = ""):
         """
         Initialize the summarizer.
         
         Args:
             model_access_key: Gradient AI model access key
             model: Model to use (default: openai-gpt-oss-120b)
+            proxy: Optional proxy URL for YouTube requests (e.g., "http://host:port")
+            cookies_from_browser: Browser name to extract cookies from (chrome, firefox, safari, etc.)
         """
         self.client = Gradient(model_access_key=model_access_key)
         self.model = model
+        self.proxy = proxy
+        self.cookies_from_browser = cookies_from_browser
 
     @staticmethod
     def extract_video_id(url: str) -> Optional[str]:
@@ -75,51 +77,175 @@ class YouTubeSummarizer:
         
         return None
 
-    def get_transcript(self, video_id: str) -> tuple[str, float]:
+    def get_video_info(self, video_url: str) -> tuple[str, str, float]:
         """
-        Fetch the transcript for a YouTube video.
+        Fetch video info and transcript using yt-dlp.
         
         Args:
-            video_id: YouTube video ID
+            video_url: YouTube video URL
             
         Returns:
-            Tuple of (full transcript text, duration in minutes)
+            Tuple of (transcript text, video title, duration in minutes)
             
         Raises:
             ValueError: If transcript cannot be retrieved
         """
-        ytt_api = YouTubeTranscriptApi()
+        video_id = self.extract_video_id(video_url)
+        
+        # Configure yt-dlp options
+        ydl_opts = {
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': ['en', 'en-US', 'en-GB'],
+            'subtitlesformat': 'json3',
+            'skip_download': True,
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+        
+        # Add proxy if configured
+        if self.proxy:
+            logger.info("Using proxy for YouTube requests")
+            ydl_opts['proxy'] = self.proxy
+        
+        # Add browser cookies if configured (bypasses bot verification)
+        if self.cookies_from_browser:
+            logger.info(f"Using cookies from browser: {self.cookies_from_browser}")
+            ydl_opts['cookiesfrombrowser'] = (self.cookies_from_browser,)
         
         try:
-            transcript = ytt_api.fetch(video_id, languages=['en', 'en-US', 'en-GB'])
-        except TranscriptsDisabled:
-            raise ValueError(f"Transcripts are disabled for video: {video_id}")
-        except NoTranscriptFound:
-            # Try to get auto-generated transcript with default language
-            try:
-                transcript = ytt_api.fetch(video_id)
-            except Exception as e:
-                raise ValueError(f"No transcript available for video: {video_id}. Error: {e}")
-        except VideoUnavailable:
-            raise ValueError(f"Video unavailable: {video_id}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                logger.info(f"Extracting video info for: {video_url}")
+                info = ydl.extract_info(video_url, download=False)
+                
+                if not info:
+                    raise ValueError(f"Could not extract video info for: {video_url}")
+                
+                # Get video metadata
+                title = info.get('title', f'Video {video_id}')
+                duration_seconds = info.get('duration', 0) or 0
+                duration_minutes = duration_seconds / 60
+                
+                logger.info(f"Video: {title} ({duration_minutes:.1f} min)")
+                
+                # Try to get subtitles
+                transcript_text = self._extract_subtitles(info, video_url, ydl)
+                
+                if not transcript_text:
+                    raise ValueError(
+                        f"No transcript/subtitles available for video: {title}\n"
+                        f"This video may not have captions enabled."
+                    )
+                
+                logger.info(f"Retrieved transcript: {len(transcript_text)} chars")
+                return transcript_text, title, duration_minutes
+                
+        except yt_dlp.utils.DownloadError as e:
+            error_str = str(e)
+            if "Private video" in error_str:
+                raise ValueError("This video is private and cannot be accessed.")
+            elif "Video unavailable" in error_str:
+                raise ValueError("This video is unavailable.")
+            elif "Sign in" in error_str or "bot" in error_str.lower():
+                raise ValueError(
+                    "YouTube requires bot verification. To fix this:\n\n"
+                    "1. Add to your .env file:\n"
+                    "   YOUTUBE_COOKIES_FROM_BROWSER=chrome\n"
+                    "   (or: firefox, safari, edge, brave)\n\n"
+                    "2. Make sure you're logged into YouTube in that browser\n\n"
+                    "3. Restart the server and try again"
+                )
+            else:
+                raise ValueError(f"Failed to access video: {e}")
         except Exception as e:
-            raise ValueError(f"Failed to get transcript: {e}")
+            raise ValueError(f"Failed to get video info: {e}")
 
-        # Convert transcript to list of segments
-        transcript_list = list(transcript)
+    def _extract_subtitles(self, info: dict, video_url: str, ydl: yt_dlp.YoutubeDL) -> Optional[str]:
+        """Extract subtitles from video info or download them."""
         
-        # Combine all transcript segments
-        full_text = " ".join(entry.text for entry in transcript_list)
+        # Check for available subtitles
+        subtitles = info.get('subtitles', {})
+        automatic_captions = info.get('automatic_captions', {})
         
-        # Calculate duration from last segment
-        if transcript_list:
-            last_segment = transcript_list[-1]
-            duration_minutes = (last_segment.start + getattr(last_segment, 'duration', 0)) / 60
-        else:
-            duration_minutes = 0
-
-        logger.info(f"Retrieved transcript: {len(full_text)} chars, {duration_minutes:.1f} minutes")
-        return full_text, duration_minutes
+        # Prefer manual subtitles, fall back to auto-generated
+        available_subs = subtitles if subtitles else automatic_captions
+        
+        if not available_subs:
+            logger.warning("No subtitles available for this video")
+            return None
+        
+        # Find English subtitles
+        sub_lang = None
+        for lang in ['en', 'en-US', 'en-GB', 'en-AU']:
+            if lang in available_subs:
+                sub_lang = lang
+                break
+        
+        # If no English, try first available language
+        if not sub_lang and available_subs:
+            sub_lang = list(available_subs.keys())[0]
+            logger.info(f"No English subtitles, using: {sub_lang}")
+        
+        if not sub_lang:
+            return None
+        
+        # Get the subtitle URL (prefer json3 format for easier parsing)
+        sub_formats = available_subs[sub_lang]
+        sub_url = None
+        
+        for fmt in sub_formats:
+            if fmt.get('ext') == 'json3':
+                sub_url = fmt.get('url')
+                break
+        
+        # Fall back to first available format
+        if not sub_url and sub_formats:
+            sub_url = sub_formats[0].get('url')
+        
+        if not sub_url:
+            return None
+        
+        # Download and parse subtitles
+        try:
+            import urllib.request
+            with urllib.request.urlopen(sub_url, timeout=30) as response:
+                sub_data = response.read().decode('utf-8')
+            
+            # Try to parse as JSON3 format
+            try:
+                sub_json = json.loads(sub_data)
+                events = sub_json.get('events', [])
+                
+                texts = []
+                for event in events:
+                    segs = event.get('segs', [])
+                    for seg in segs:
+                        text = seg.get('utf8', '').strip()
+                        if text and text != '\n':
+                            texts.append(text)
+                
+                return ' '.join(texts)
+            except json.JSONDecodeError:
+                # Not JSON, might be VTT or SRT format
+                # Simple extraction: remove timing lines
+                lines = sub_data.split('\n')
+                texts = []
+                for line in lines:
+                    line = line.strip()
+                    # Skip timing lines, headers, and empty lines
+                    if not line or '-->' in line or line.startswith('WEBVTT') or line.isdigit():
+                        continue
+                    # Remove HTML tags
+                    clean_line = re.sub(r'<[^>]+>', '', line)
+                    if clean_line:
+                        texts.append(clean_line)
+                
+                return ' '.join(texts)
+                
+        except Exception as e:
+            logger.error(f"Failed to download subtitles: {e}")
+            return None
 
     def _chunk_transcript(self, transcript: str) -> list[str]:
         """
@@ -326,8 +452,8 @@ Now provide your response in this exact format:
         
         logger.info(f"Processing video: {video_id}")
         
-        # Get transcript
-        transcript, duration_minutes = self.get_transcript(video_id)
+        # Get transcript and video info using yt-dlp
+        transcript, video_title, duration_minutes = self.get_video_info(url)
         
         # Chunk the transcript for long videos
         chunks = self._chunk_transcript(transcript)
@@ -358,9 +484,6 @@ Now provide your response in this exact format:
             self._generate_final_summary,
             chunk_summaries
         )
-        
-        # Try to get video title (we'll use a placeholder for now)
-        video_title = f"Video {video_id}"
         
         return VideoSummary(
             video_id=video_id,
