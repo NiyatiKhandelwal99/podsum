@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # Available models: openai-gpt-oss-120b, gpt-oss-20b, claude-sonnet-4, llama-3.3-instruct-70b
     # Set GRADIENT_MODEL in .env to override (e.g., GRADIENT_MODEL=gpt-oss-20b)
     gradient_model: str = "openai-gpt-oss-120b"
+    gradient_api_delay_seconds: float = 8.0  # Delay between API calls to avoid rate limits
+    
+    # Optional AI Features (can disable to reduce API calls)
+    enable_query_enhancement: bool = True  # AI query enhancement for search
+    enable_result_ranking: bool = True  # AI result ranking for search
     
     # YouTube Transcript Proxy (optional - for IP ban workaround)
     # Format: "http://user:pass@host:port" or "http://host:port"

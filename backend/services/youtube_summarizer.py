@@ -12,8 +12,13 @@ from pathlib import Path
 
 import yt_dlp
 from gradient import Gradient
+from config import settings
+from services.gradient_utils import safe_gradient_call, is_rate_limit_error
 
 logger = logging.getLogger(__name__)
+
+# Configurable delay between API calls
+API_CALL_DELAY_SECONDS = settings.gradient_api_delay_seconds
 
 # Thread pool for parallel API calls
 _executor = ThreadPoolExecutor(max_workers=10)
@@ -314,13 +319,19 @@ Provide a concise but comprehensive summary (500-800 words) covering:
 
 Be specific and reference actual content."""
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=1500  # Reduced for faster response
-        )
+        try:
+            response = safe_gradient_call(
+                gradient_client=self.client,
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1500,
+                operation_name=f"Chunk {chunk_num} summarization"
+            )
+        except Exception as e:
+            if is_rate_limit_error(e):
+                logger.error(f"Chunk {chunk_num} failed due to rate limit after retries")
+                raise ValueError(f"Rate limit exceeded. Please wait a moment and try again.")
+            raise
         
         # Get response details
         choice = response.choices[0]
@@ -336,11 +347,19 @@ Be specific and reference actual content."""
             truncated_chunk = chunk[:4000]  # Use only first half
             retry_prompt = f"Summarize this transcript in 3-5 bullet points:\n\n{truncated_chunk}"
             
-            retry_response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": retry_prompt}],
-                max_tokens=1000
-            )
+            try:
+                retry_response = safe_gradient_call(
+                    gradient_client=self.client,
+                    model=self.model,
+                    messages=[{"role": "user", "content": retry_prompt}],
+                    max_tokens=1000,
+                    operation_name=f"Chunk {chunk_num} retry summarization"
+                )
+            except Exception as e:
+                if is_rate_limit_error(e):
+                    logger.error(f"Chunk {chunk_num} retry failed due to rate limit")
+                    raise ValueError(f"Rate limit exceeded. Please wait a moment and try again.")
+                raise
             summary = retry_response.choices[0].message.content or ""
             logger.info(f"Chunk {chunk_num} retry: {len(summary)} chars")
         
@@ -392,13 +411,19 @@ Now provide your response in this exact format:
 4. [Fourth key learning]
 5. [Fifth key learning]"""
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=2500
-        )
+        try:
+            response = safe_gradient_call(
+                gradient_client=self.client,
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2500,
+                operation_name="Final summary generation"
+            )
+        except Exception as e:
+            if is_rate_limit_error(e):
+                logger.error("Final summary failed due to rate limit after retries")
+                raise ValueError(f"Rate limit exceeded. Please wait a moment and try again.")
+            raise
         
         content = response.choices[0].message.content
         
@@ -445,10 +470,10 @@ Now provide your response in this exact format:
         semaphore = _get_api_semaphore(max_concurrent=1)
         
         async with semaphore:
-            # Wait 3 seconds BEFORE making request to respect rate limits
+            # Wait before making request to respect rate limits
             if chunk_num > 1:
-                logger.info(f"Waiting 3s before chunk {chunk_num}...")
-                await asyncio.sleep(3)
+                logger.info(f"Waiting {API_CALL_DELAY_SECONDS}s before chunk {chunk_num}...")
+                await asyncio.sleep(API_CALL_DELAY_SECONDS)
             
             logger.info(f"Chunk {chunk_num}/{total_chunks}: processing ({len(chunk):,} chars)...")
             loop = asyncio.get_event_loop()
@@ -504,8 +529,8 @@ Now provide your response in this exact format:
         logger.info(f"All {len(chunks)} chunks processed")
         
         # Generate final summary and top learnings (with rate limit protection)
-        logger.info("Waiting 3s before final summary...")
-        await asyncio.sleep(3)
+        logger.info(f"Waiting {API_CALL_DELAY_SECONDS}s before final summary...")
+        await asyncio.sleep(API_CALL_DELAY_SECONDS)
         logger.info("Generating final summary and learnings...")
         semaphore = _get_api_semaphore(max_concurrent=1)
         async with semaphore:
