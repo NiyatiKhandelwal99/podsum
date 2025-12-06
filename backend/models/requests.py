@@ -18,3 +18,8 @@ class YouTubeSummarizeRequest(BaseModel):
         examples=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]
     )
 
+
+class SearchRequest(BaseModel):
+    """Request model for the search endpoint."""
+    
+    query: str
