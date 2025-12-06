@@ -8,6 +8,7 @@ from models.requests import YouTubeSummarizeRequest
 from models.responses import YouTubeSummarizeResponse
 from services.youtube_summarizer import YouTubeSummarizer
 from services.notion import save_summary_to_notion
+from services.gradient_utils import is_rate_limit_error
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +83,27 @@ async def summarize_youtube_video(request: YouTubeSummarizeRequest):
         )
         
     except ValueError as e:
-        logger.error(f"Validation error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        error_msg = str(e)
+        logger.error(f"Validation error: {error_msg}")
+        
+        # Check if it's a rate limit error
+        if is_rate_limit_error(e) or "rate limit" in error_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded. Please wait a moment and try again. The API is processing your request with automatic retries."
+            )
+        
+        raise HTTPException(status_code=400, detail=error_msg)
     except Exception as e:
-        logger.exception(f"Error summarizing video: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to summarize video: {str(e)}")
+        error_msg = str(e)
+        logger.exception(f"Error summarizing video: {error_msg}")
+        
+        # Check if it's a rate limit error
+        if is_rate_limit_error(e) or "rate limit" in error_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded. Please wait a moment and try again. The API is processing your request with automatic retries."
+            )
+        
+        raise HTTPException(status_code=500, detail=f"Failed to summarize video: {error_msg}")
 

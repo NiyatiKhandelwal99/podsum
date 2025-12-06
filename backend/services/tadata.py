@@ -4,10 +4,12 @@ import logging
 import json
 import re
 import time
+import asyncio
 from typing import Optional
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from config import settings
+from services.gradient_utils import safe_gradient_call, is_rate_limit_error
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,10 @@ async def _enhance_query_with_ai(query: str) -> str:
     logger.info("[QUERY ENHANCEMENT] Using Gradient AI for query enhancement")
     logger.debug(f"[QUERY ENHANCEMENT] Model: {settings.gradient_model}")
     
+    # Add delay before API call to respect rate limits
+    logger.info("[QUERY ENHANCEMENT] Waiting 5s before API call...")
+    await asyncio.sleep(5)
+    
     try:
         prompt = f"""Analyze this podcast search query: "{query}"
 
@@ -117,10 +123,12 @@ Return ONLY the optimized search query, nothing else."""
         logger.debug(f"[QUERY ENHANCEMENT] Sending request to Gradient AI...")
         
         start_time = time.time()
-        response = gradient_client.chat.completions.create(
+        response = safe_gradient_call(
+            gradient_client=gradient_client,
             model=settings.gradient_model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=200
+            max_tokens=200,
+            operation_name="Query enhancement"
         )
         ai_time = time.time() - start_time
         
@@ -139,8 +147,12 @@ Return ONLY the optimized search query, nothing else."""
         return enhanced_query
         
     except Exception as e:
-        logger.error(f"[QUERY ENHANCEMENT] AI query enhancement failed: {e}", exc_info=True)
-        logger.warning("[QUERY ENHANCEMENT] Falling back to keyword-based enhancement")
+        if is_rate_limit_error(e):
+            logger.error(f"[QUERY ENHANCEMENT] Rate limit error: {e}")
+            logger.warning("[QUERY ENHANCEMENT] Falling back to keyword-based enhancement due to rate limit")
+        else:
+            logger.error(f"[QUERY ENHANCEMENT] AI query enhancement failed: {e}", exc_info=True)
+            logger.warning("[QUERY ENHANCEMENT] Falling back to keyword-based enhancement")
         return _enhance_query_with_keywords(query)
 
 
@@ -180,6 +192,10 @@ async def _rank_results_with_ai(results: list, original_query: str) -> Optional[
     logger.info("[AI RANKING] Starting AI result ranking")
     logger.debug(f"[AI RANKING] Original query: '{original_query}'")
     logger.debug(f"[AI RANKING] Number of results to rank: {len(results)}")
+    
+    if not settings.enable_result_ranking:
+        logger.info("[AI RANKING] Result ranking disabled in config")
+        return None
     
     gradient_client = _get_gradient_client()
     if not gradient_client:
@@ -223,12 +239,25 @@ If no good match exists, return "NO_MATCH"."""
         logger.debug(f"[AI RANKING] Prompt length: {len(prompt)} characters")
         logger.debug(f"[AI RANKING] Sending ranking request to Gradient AI...")
         
+        # Add delay before API call to respect rate limits
+        logger.info("[AI RANKING] Waiting 5s before API call...")
+        await asyncio.sleep(5)
+        
         start_time = time.time()
-        response = gradient_client.chat.completions.create(
-            model=settings.gradient_model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=300
-        )
+        try:
+            response = safe_gradient_call(
+                gradient_client=gradient_client,
+                model=settings.gradient_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                operation_name="Result ranking"
+            )
+        except Exception as e:
+            if is_rate_limit_error(e):
+                logger.error(f"[AI RANKING] Rate limit error: {e}")
+                logger.warning("[AI RANKING] Falling back to first result due to rate limit")
+                return None
+            raise
         ai_time = time.time() - start_time
         
         logger.info(f"[AI RANKING] AI response received in {ai_time:.2f}s")
@@ -501,11 +530,15 @@ async def search_youtube_podcast(query: str) -> dict:
     # Step 1: Enhance query with AI (or fallback to keywords)
     logger.info("[SEARCH] Step 1: Query enhancement")
     enhance_start = time.time()
-    enhanced_query = await _enhance_query_with_ai(query)
+    if settings.enable_query_enhancement:
+        enhanced_query = await _enhance_query_with_ai(query)
+    else:
+        logger.info("[SEARCH] Query enhancement disabled, using keyword-based enhancement")
+        enhanced_query = _enhance_query_with_keywords(query)
     enhance_time = time.time() - enhance_start
     logger.info(f"[SEARCH] Query enhancement completed in {enhance_time:.2f}s")
     logger.info(f"[SEARCH] Enhanced query: '{enhanced_query}'")
-    logger.debug(f"[SEARCH] Enhancement method: {'AI' if enhanced_query != f'{query} full episode interview' else 'Keyword-based'}")
+    logger.debug(f"[SEARCH] Enhancement method: {'AI' if settings.enable_query_enhancement and enhanced_query != f'{query} full episode interview' else 'Keyword-based'}")
     
     # Step 2: Search Tavily with advanced parameters
     logger.info("[SEARCH] Step 2: Tavily search")
@@ -583,15 +616,19 @@ async def search_youtube_podcast(query: str) -> dict:
     logger.info("[SEARCH] Step 4: Rank results")
     rank_start = time.time()
     
-    logger.debug("[SEARCH] Attempting AI ranking...")
-    best_result = await _rank_results_with_ai(all_results, query)
-    
-    if best_result:
-        logger.info("[SEARCH] AI ranking succeeded")
-        logger.debug(f"[SEARCH] AI selected result: '{best_result.get('title', 'N/A')}'")
+    if settings.enable_result_ranking:
+        logger.debug("[SEARCH] Attempting AI ranking...")
+        best_result = await _rank_results_with_ai(all_results, query)
+        
+        if best_result:
+            logger.info("[SEARCH] AI ranking succeeded")
+            logger.debug(f"[SEARCH] AI selected result: '{best_result.get('title', 'N/A')}'")
+        else:
+            logger.info("[SEARCH] AI ranking unavailable or failed, using first result")
+            best_result = all_results[0] if all_results else None
     else:
-        logger.info("[SEARCH] AI ranking unavailable or failed, using keyword-based ranking")
-        best_result = _rank_results_with_keywords(all_results)
+        logger.info("[SEARCH] Result ranking disabled, using first result")
+        best_result = all_results[0] if all_results else None
     
     rank_time = time.time() - rank_start
     logger.info(f"[SEARCH] Result ranking completed in {rank_time:.2f}s")
