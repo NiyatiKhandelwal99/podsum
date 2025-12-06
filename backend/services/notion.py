@@ -111,6 +111,103 @@ def _get_notion_mcp_client() -> Optional[MultiServerMCPClient]:
     return _notion_mcp_client
 
 
+def _format_summary_as_markdown(
+    title: str,
+    video_url: str,
+    video_id: str,
+    duration_minutes: float,
+    transcript_length: int,
+    summary: str,
+    top_learnings: list[str]
+) -> dict:
+    """
+    Format summary data as Notion-flavored Markdown for MCP.
+    
+    Returns a dict with title and content in Markdown format.
+    """
+    logger.debug("[NOTION] Formatting summary as Notion Markdown")
+    
+    # Format date
+    current_date = datetime.now().strftime("%B %d, %Y")  # e.g., "December 06, 2024"
+    
+    # Create page title
+    page_title = title if title else f"Podcast Summary - {video_id}"
+    
+    # Format duration nicely
+    if duration_minutes >= 60:
+        hours = int(duration_minutes // 60)
+        mins = int(duration_minutes % 60)
+        duration_str = f"{hours}h {mins}m"
+    else:
+        duration_str = f"{int(duration_minutes)} min"
+    
+    # Build Notion-flavored Markdown content
+    content_parts = []
+    
+    # Hero callout with video info (purple theme)
+    content_parts.append(f"""<callout icon="🎬" color="purple">
+# 📺 Video Summary
+
+⏱️ **Duration:** {duration_str}  •  📅 **Date:** {current_date}
+
+▶️ [**Watch on YouTube**]({video_url})
+</callout>""")
+    
+    content_parts.append("")
+    
+    # Summary section with blue accent
+    content_parts.append("## 📝 Summary")
+    content_parts.append("")
+    content_parts.append(f"""<callout icon="📖" color="blue">
+{summary}
+</callout>""")
+    
+    content_parts.append("")
+    content_parts.append("---")
+    content_parts.append("")
+    
+    # Key Learnings section with colored callouts for each learning
+    content_parts.append("## 💡 Key Takeaways")
+    content_parts.append("")
+    
+    # Use different colored icons for visual variety
+    learning_styles = [
+        ("🔵", "blue"),      # Blue
+        ("🟢", "green"),     # Green  
+        ("🟣", "purple"),    # Purple
+        ("🟠", "orange"),    # Orange
+        ("🔴", "red"),       # Red
+    ]
+    
+    for i, learning in enumerate(top_learnings):
+        icon, color = learning_styles[i % len(learning_styles)]
+        # Notion callouts with color hints
+        content_parts.append(f"""<callout icon="{icon}" color="{color}">
+**Insight {i+1}:** {learning}
+</callout>""")
+        content_parts.append("")
+    
+    content_parts.append("---")
+    content_parts.append("")
+    
+    # Video metadata in a gray callout (subtle)
+    content_parts.append("## 📊 Video Details")
+    content_parts.append("")
+    content_parts.append(f"""<callout icon="⚙️" color="gray">
+| Property | Value |
+|----------|-------|
+| **Video ID** | `{video_id}` |
+| **Duration** | {duration_str} |
+| **Transcript** | {transcript_length:,} characters |
+| **Processed** | {current_date} |
+</callout>""")
+    
+    return {
+        "title": page_title,
+        "content": "\n".join(content_parts)
+    }
+
+
 def _format_summary_for_notion(
     title: str,
     video_url: str,
@@ -121,7 +218,7 @@ def _format_summary_for_notion(
     top_learnings: list[str]
 ) -> dict:
     """
-    Format summary data into Notion page structure.
+    Format summary data into Notion page structure (legacy block format).
     
     Returns a dict with page properties and blocks ready for Notion API.
     """
@@ -423,9 +520,9 @@ async def save_summary_to_notion(
             logger.error(f"[NOTION]   3. Notion MCP server URL is correct")
             return None
         
-        # Format content
-        logger.debug("[NOTION] Formatting content for Notion...")
-        formatted = _format_summary_for_notion(
+        # Format content as Notion-flavored Markdown (for MCP)
+        logger.debug("[NOTION] Formatting content as Markdown for MCP...")
+        formatted = _format_summary_as_markdown(
             title=title,
             video_url=video_url,
             video_id=video_id,
@@ -435,11 +532,11 @@ async def save_summary_to_notion(
             top_learnings=top_learnings
         )
         
-        # Create page
+        # Create page with content using MCP
         logger.info("=" * 80)
-        logger.info("[NOTION PAGE] Starting page creation")
+        logger.info("[NOTION PAGE] Starting page creation via MCP")
         logger.info(f"[NOTION PAGE] Page title: '{formatted['title']}'")
-        logger.info(f"[NOTION PAGE] Number of blocks to add: {len(formatted['blocks'])}")
+        logger.info(f"[NOTION PAGE] Content length: {len(formatted['content'])} chars")
         logger.debug(f"[NOTION PAGE] Parent page ID: {settings.notion_parent_page_id or 'None (workspace root)'}")
         
         # Inspect tool schema to understand expected format
@@ -493,23 +590,16 @@ async def save_summary_to_notion(
             try:
                 logger.info(f"[NOTION PAGE] Attempt {attempt}/{len(parent_formats_to_try)}: {'with parent' if try_parent else 'without parent'}")
                 
-                # Build page object
+                # Build page object with Notion-flavored Markdown content
+                # MCP supports: properties.title (string) + content (markdown)
                 page_object = {
                     "properties": {
-                        "title": [
-                            {
-                                "text": {
-                                    "content": formatted["title"]
-                                }
-                            }
-                        ]
+                        "title": formatted["title"]
                     },
-                    "children": formatted["blocks"]
+                    "content": formatted["content"]  # Notion-flavored Markdown
                 }
                 
-                # Add parent if specified
                 if try_parent:
-                    page_object["parent"] = try_parent
                     logger.debug(f"[NOTION PAGE]   Parent config: {try_parent}")
                 
                 create_params = {

@@ -18,6 +18,16 @@ logger = logging.getLogger(__name__)
 # Thread pool for parallel API calls
 _executor = ThreadPoolExecutor(max_workers=10)
 
+# Semaphore to limit concurrent Gradient API calls (avoid rate limiting)
+_api_semaphore = None
+
+def _get_api_semaphore(max_concurrent: int = 3):
+    """Get or create semaphore for rate limiting API calls."""
+    global _api_semaphore
+    if _api_semaphore is None:
+        _api_semaphore = asyncio.Semaphore(max_concurrent)
+    return _api_semaphore
+
 
 @dataclass
 class VideoSummary:
@@ -35,9 +45,10 @@ class YouTubeSummarizer:
     """Extracts transcripts from YouTube videos and generates AI summaries."""
 
     # Chunk size for processing long transcripts (in characters)
-    # Reduced to avoid hitting token limits on the model
-    CHUNK_SIZE = 8000  # ~2000 tokens per chunk - smaller for better summaries
-    MAX_CHUNKS_FOR_SUMMARY = 30  # Increased limit for longer videos
+    # With 131k token context, we can use MUCH larger chunks
+    # 100k chars ≈ 25k tokens, leaving room for prompt + response
+    CHUNK_SIZE = 100000  # ~25k tokens per chunk - leverage the large context window
+    MAX_CHUNKS_FOR_SUMMARY = 6  # Most videos will only need 1-3 chunks now
 
     def __init__(self, model_access_key: str, model: str = "openai-gpt-oss-120b", proxy: str = "", cookies_from_browser: str = ""):
         """
@@ -296,14 +307,19 @@ TRANSCRIPT:
 {chunk}
 \"\"\"
 
-Provide a detailed summary with the main points, key insights, and important takeaways from this section. Be specific and reference actual content from the transcript."""
+Provide a concise but comprehensive summary (500-800 words) covering:
+- Main topics and themes discussed
+- Key insights and notable points
+- Important quotes or ideas
+
+Be specific and reference actual content."""
 
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=2000
+            max_tokens=1500  # Reduced for faster response
         )
         
         # Get response details
@@ -424,15 +440,26 @@ Now provide your response in this exact format:
         return summary, learnings[:5]
 
     async def _summarize_chunk_async(self, chunk: str, chunk_num: int, total_chunks: int) -> tuple[int, str]:
-        """Async wrapper to run chunk summarization in thread pool."""
-        loop = asyncio.get_event_loop()
-        summary = await loop.run_in_executor(
-            _executor,
-            self._summarize_chunk,
-            chunk,
-            chunk_num,
-            total_chunks
-        )
+        """Async wrapper to run chunk summarization in thread pool with rate limiting."""
+        # Use semaphore to limit to 1 concurrent call (Gradient has strict rate limits)
+        semaphore = _get_api_semaphore(max_concurrent=1)
+        
+        async with semaphore:
+            # Wait 3 seconds BEFORE making request to respect rate limits
+            if chunk_num > 1:
+                logger.info(f"Waiting 3s before chunk {chunk_num}...")
+                await asyncio.sleep(3)
+            
+            logger.info(f"Chunk {chunk_num}/{total_chunks}: processing ({len(chunk):,} chars)...")
+            loop = asyncio.get_event_loop()
+            summary = await loop.run_in_executor(
+                _executor,
+                self._summarize_chunk,
+                chunk,
+                chunk_num,
+                total_chunks
+            )
+        
         return chunk_num, summary
 
     async def summarize_video(self, url: str) -> VideoSummary:
@@ -458,8 +485,8 @@ Now provide your response in this exact format:
         # Chunk the transcript for long videos
         chunks = self._chunk_transcript(transcript)
         
-        # Summarize all chunks IN PARALLEL for speed
-        logger.info(f"Summarizing {len(chunks)} chunks in parallel...")
+        # Summarize chunks sequentially (Gradient has strict rate limits)
+        logger.info(f"Summarizing {len(chunks)} chunks sequentially...")
         
         # Create async tasks for all chunks
         tasks = [
@@ -474,16 +501,20 @@ Now provide your response in this exact format:
         results.sort(key=lambda x: x[0])
         chunk_summaries = [summary for _, summary in results]
         
-        logger.info(f"All {len(chunks)} chunks processed in parallel")
+        logger.info(f"All {len(chunks)} chunks processed")
         
-        # Generate final summary and top learnings
+        # Generate final summary and top learnings (with rate limit protection)
+        logger.info("Waiting 3s before final summary...")
+        await asyncio.sleep(3)
         logger.info("Generating final summary and learnings...")
-        loop = asyncio.get_event_loop()
-        final_summary, top_learnings = await loop.run_in_executor(
-            _executor,
-            self._generate_final_summary,
-            chunk_summaries
-        )
+        semaphore = _get_api_semaphore(max_concurrent=1)
+        async with semaphore:
+            loop = asyncio.get_event_loop()
+            final_summary, top_learnings = await loop.run_in_executor(
+                _executor,
+                self._generate_final_summary,
+                chunk_summaries
+            )
         
         return VideoSummary(
             video_id=video_id,
