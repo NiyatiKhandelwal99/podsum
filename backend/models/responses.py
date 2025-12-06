@@ -29,4 +29,13 @@ class YouTubeSummarizeResponse(BaseModel):
         min_length=5,
         max_length=5
     )
+    notion_page_url: str | None = Field(None, description="URL of created Notion page")
+    saved_to_notion: bool = Field(False, description="Whether summary was saved to Notion")
 
+
+class SearchResponse(BaseModel):
+    """Response model for the search endpoint."""
+    
+    youtube_url: str
+    title: str
+    query: str
